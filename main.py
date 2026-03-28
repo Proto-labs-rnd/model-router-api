@@ -19,6 +19,8 @@ API_KEY = os.getenv("API_KEY", "dev-key-change-me")
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 FREE_TIER_DAILY = int(os.getenv("FREE_TIER_DAILY_REQUESTS", 100))
 
 # Initialize FastAPI
@@ -67,6 +69,31 @@ class HealthResponse(BaseModel):
     status: str = Field(..., description="Health status")
     version: str = Field(..., description="API version")
     models: Dict[str, str] = Field(..., description="Model provider status")
+
+class GenerateRequest(BaseModel):
+    prompt: str = Field(..., description="The prompt to generate from", min_length=1)
+    complexity: str = Field(
+        default="medium",
+        description="Task complexity: low, medium, or high"
+    )
+    context: Optional[Dict[str, Any]] = Field(
+        default={},
+        description="Additional context"
+    )
+    max_tokens: Optional[int] = Field(
+        default=1024,
+        description="Maximum tokens to generate"
+    )
+
+class GenerateResponse(BaseModel):
+    model: str = Field(..., description="Model used for generation")
+    generation: str = Field(..., description="Generated text")
+    reasoning: str = Field(..., description="Routing reasoning")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Model confidence")
+    tokens_used: int = Field(..., description="Tokens used in generation")
+    cost: float = Field(..., description="Cost in USD")
+    cost_saved: float = Field(..., description="Cost saved vs premium model")
+    complexity: str = Field(..., description="Task complexity used")
 
 # Helper functions
 def get_redis():
@@ -205,6 +232,84 @@ def track_request(user_id: str, model: str, cost_saved: float):
     # Set expiration for daily counter
     rd.expire(f"user:{user_id}:requests:{today}", 86400 * 2)
 
+async def generate_from_ollama(prompt: str, model: str, max_tokens: int = 1024) -> Dict[str, Any]:
+    """
+    Generate text using Ollama model.
+    Returns: {generation, tokens_used, cost}
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json={
+                    "model": model.replace("ollama/", ""),
+                    "prompt": prompt,
+                    "stream": False,
+                    "num_predict": max_tokens
+                }
+            )
+
+            if response.status_code != 200:
+                raise Exception(f"Ollama error: {response.status_code}")
+
+            data = response.json()
+            generation = data.get("response", "")
+            tokens_used = data.get("eval_count", estimate_tokens(generation))
+
+            # Local models are essentially free
+            cost = 0.0
+
+            return {
+                "generation": generation,
+                "tokens_used": tokens_used,
+                "cost": cost
+            }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Ollama unavailable: {str(e)}")
+
+async def generate_from_openrouter(prompt: str, model: str, max_tokens: int = 1024) -> Dict[str, Any]:
+    """
+    Generate text using OpenRouter API.
+    Returns: {generation, tokens_used, cost}
+    """
+    if not OPENROUTER_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenRouter not configured")
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                OPENROUTER_BASE_URL,
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "HTTP-Referer": "https://model-router-api.dev",
+                    "X-Title": "Model Router API"
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens
+                }
+            )
+
+            if response.status_code != 200:
+                error_detail = response.json().get("error", {}).get("message", "Unknown error")
+                raise Exception(f"OpenRouter error: {error_detail}")
+
+            data = response.json()
+            generation = data["choices"][0]["message"]["content"]
+            tokens_used = data.get("usage", {}).get("total_tokens", estimate_tokens(generation))
+
+            # Extract cost from response
+            cost = data.get("usage", {}).get("total_cost", 0.005)
+
+            return {
+                "generation": generation,
+                "tokens_used": tokens_used,
+                "cost": cost
+            }
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"OpenRouter unavailable: {str(e)}")
+
 def get_user_stats(user_id: str) -> Dict[str, Any]:
     """Get user statistics from Redis"""
     rd = get_redis()
@@ -277,6 +382,58 @@ async def stats(authorization: str = Header(...)):
     
     return StatsResponse(**get_user_stats(user_id))
 
+@app.post("/v1/generate", response_model=GenerateResponse)
+async def generate(request: GenerateRequest, authorization: str = Header(...)):
+    """
+    Generate text using intelligent model routing.
+
+    Routes to appropriate model:
+    - complexity=low/medium → Ollama (fast, cheap)
+    - complexity=high → OpenRouter (powerful)
+
+    Tracks usage and enforces quotas.
+    """
+    # Validate API key
+    check_api_key(authorization)
+
+    # Check quota
+    user_id = hashlib.md5(authorization.encode()).hexdigest()[:8]
+    stats = get_user_stats(user_id)
+    if stats["quota_remaining"] <= 0:
+        raise HTTPException(status_code=429, detail="Daily quota exceeded")
+
+    # Validate complexity
+    if request.complexity not in ["low", "medium", "high"]:
+        raise HTTPException(status_code=400, detail="Invalid complexity: must be low, medium, or high")
+
+    # Route to appropriate model and provider
+    if request.complexity in ["low", "medium"]:
+        # Use Ollama for simple/medium tasks
+        model = "ollama/phi3:mini" if request.complexity == "medium" else "ollama/llama3.2:3b"
+        reasoning = f"Complexity {request.complexity} → local Ollama model (fast, cheap)"
+        result = await generate_from_ollama(request.prompt, model, request.max_tokens)
+        cost_saved = 0.005 - result["cost"]
+    else:
+        # Use OpenRouter for complex tasks
+        model = "anthropic/claude-sonnet-4"
+        reasoning = f"Complexity high → premium OpenRouter model (accurate, powerful)"
+        result = await generate_from_openrouter(request.prompt, model, request.max_tokens)
+        cost_saved = 0.0
+
+    # Track usage
+    track_request(user_id, model, cost_saved)
+
+    return GenerateResponse(
+        model=model,
+        generation=result["generation"],
+        reasoning=reasoning,
+        confidence=0.85,
+        tokens_used=result["tokens_used"],
+        cost=result["cost"],
+        cost_saved=cost_saved,
+        complexity=request.complexity
+    )
+
 @app.get("/v1/health", response_model=HealthResponse)
 async def health():
     """Health check endpoint."""
@@ -289,13 +446,16 @@ async def health():
                 ollama_status = "connected"
     except Exception:
         pass
-    
+
+    # Check OpenRouter configuration
+    openrouter_status = "configured" if OPENROUTER_API_KEY else "not_configured"
+
     return HealthResponse(
         status="healthy",
         version="1.0.0",
         models={
             "ollama": ollama_status,
-            "openrouter": "not_configured"
+            "openrouter": openrouter_status
         }
     )
 
