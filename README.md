@@ -1,123 +1,132 @@
-# Model Router API
+# Model Router API 🎯
 
 **Intelligent model routing for LLM applications — save up to 80% on costs while maintaining quality.**
 
-## 🎯 What It Does
+## What It Does
 
-Automatically routes your prompts to the best model based on task complexity:
-- **Simple tasks** → Local small models (phi3:mini, llama3.2:3b)
-- **Complex tasks** → Cloud powerful models (Claude, GPT-4)
+When you have multiple LLM models available (GPT-5, Claude, GLM, local models), not every request needs the most expensive one. This API analyzes each request and routes it to the best model based on:
 
-**Result:** 80% cost savings with 95%+ routing accuracy.
+- **Task complexity** — Simple questions → cheap model, complex reasoning → powerful model
+- **Cost optimization** — Don't waste $0.03/1K tokens on "what time is it?"
+- **Latency requirements** — Time-sensitive requests → fastest available model
+- **Fallback chains** — If a model is down, automatically try the next one
 
-## 🚀 Quick Start
+## Quick Start
+
+### Option 1: Docker (Recommended)
 
 ```bash
-# Clone and install
-git clone https://github.com/Proto-labs-rnd/model-router-api
+git clone https://github.com/Proto-labs-rnd/model-router-api.git
 cd model-router-api
+
+# Configure your API keys
+cp .env.example .env
+# Edit .env with your API keys
+
+# Start
+docker compose up -d
+# → API running on http://localhost:8000
+```
+
+### Option 2: Direct
+
+```bash
 pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your API keys
+python main.py
+```
 
-# Run the API
-uvicorn main:app --reload
+## API Usage
 
-# Test routing
-curl -X POST http://localhost:8000/v1/route \
+```bash
+# Route a chat completion request
+curl -X POST http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-api-key" \
   -d '{
-    "prompt": "Write a Python script to parse JSON",
-    "context": {"max_tokens": 1000}
+    "messages": [{"role": "user", "content": "Explain quantum computing"}],
+    "routing_strategy": "cost_optimized"
   }'
+
+# Check which model was selected
+curl http://localhost:8000/v1/routing/stats
 ```
 
-## 📊 API Endpoints
+### Supported Endpoints
 
-### `POST /v1/route` — Route a prompt
+| Endpoint | Description |
+|----------|-------------|
+| `POST /v1/chat/completions` | OpenAI-compatible chat completion (auto-routed) |
+| `POST /v1/routing/decide` | Preview which model would be selected without executing |
+| `GET /v1/routing/stats` | Routing statistics (model usage, costs, latency) |
+| `GET /v1/models` | List available models and their capabilities |
+| `GET /health` | Health check |
 
-Routes your prompt to the optimal model.
+### Routing Strategies
 
-**Request:**
-```json
-{
-  "prompt": "Summarize this log file...",
-  "context": {
-    "max_tokens": 1000,
-    "tools_available": ["python", "bash"]
-  }
-}
+| Strategy | Description |
+|----------|-------------|
+| `cost_optimized` | Cheapest model that can handle the task (default) |
+| `quality_first` | Always use the best available model |
+| `latency_optimized` | Fastest response, regardless of cost |
+| `balanced` | Balance cost, quality, and latency |
+
+## Configuration
+
+Edit `.env` to configure your models:
+
+```env
+# API Keys
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+ZAI_API_KEY=...
+
+# Model definitions
+MODELS=gpt-5.4,claude-sonnet-4-6,glm-5-turbo
+
+# Default strategy
+ROUTING_STRATEGY=cost_optimized
+
+# Server
+PORT=8000
 ```
 
-**Response:**
-```json
-{
-  "model": "ollama/phi3:mini",
-  "reasoning": "Log analysis task → local model sufficient",
-  "confidence": 0.85,
-  "estimated_cost": 0.001,
-  "estimated_savings": 0.004
-}
+## Testing
+
+```bash
+# Run automated tests
+python test_api.py
+
+# Or use the bash test script
+./test-api.sh
 ```
 
-### `GET /v1/stats` — Usage statistics
+## Architecture
 
-```json
-{
-  "requests_today": 45,
-  "quota_remaining": 55,
-  "total_saved": 12.50,
-  "models_used": {
-    "llama3.2:3b": 30,
-    "phi3:mini": 12,
-    "claude-sonnet-4": 3
-  }
-}
+```
+Client Request
+      │
+      ▼
+┌─────────────────┐
+│  Router API      │
+│  ┌─────────────┐│
+│  │ Analyzer    ││ ──→ Classify complexity, intent, domain
+│  │ Selector    ││ ──→ Pick best model for the task
+│  │ Executor    ││ ──→ Forward to chosen LLM provider
+│  │ Tracker     ││ ──→ Log cost, latency, quality
+│  └─────────────┘│
+└─────────────────┘
+      │
+      ▼
+  GPT-5.4 / Claude / GLM / Local
 ```
 
-### `GET /v1/health` — Health check
+## Requirements
 
-```json
-{
-  "status": "healthy",
-  "version": "1.0.0",
-  "models": {
-    "ollama": "connected",
-    "openrouter": "connected"
-  }
-}
-```
+- Python 3.10+
+- At least one LLM API key (OpenAI, Anthropic, or ZAI)
+- Docker (optional, recommended)
 
-## 💰 Pricing
+## License
 
-- **Free**: 100 requests/day
-- **Hobby**: 10€/mo — 10,000 requests/mo
-- **Pro**: 50€/mo — 100,000 requests/mo
-- **Enterprise**: 200€/mo — 1M requests/mo
-
-## 🔧 Features
-
-✅ **Zero-config routing** — Just send your prompt
-✅ **Local-first** — Privacy by default
-✅ **Cost transparency** — See savings in real-time
-✅ **Rate limiting** — Protects your budget
-✅ **Usage analytics** — Track your patterns
-
-## 📖 Documentation
-
-Full documentation: [DOCS.md](DOCS.md)
-
-## 🛣️ Roadmap
-
-- [ ] Beta release (v1.0)
-- [ ] Web dashboard
-- [ ] Custom routing rules
-- [ ] ML-based optimization
-- [ ] Multi-cloud support
-
-## 📄 License
-
-MIT License — feel free to self-host!
-
----
-
-**Built by Proto Labs** • [GitHub](https://github.com/Proto-labs-rnd) • [Email](mailto:proto.labs.rnd@gmail.com)
+MIT
